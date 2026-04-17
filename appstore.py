@@ -1,33 +1,16 @@
-# Google Colab / Python 3
-# Apple App Store reviews -> Excel
-# Append only new reviews, no duplicates
-# Save to local Colab, auto-download, or Google Drive
+# -*- coding: utf-8 -*-
 
-import sys
-import subprocess
-import importlib
 import hashlib
+import io
 import re
 import time
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-REQUIRED_PACKAGES = ["requests", "pandas", "openpyxl"]
-
-for pkg in REQUIRED_PACKAGES:
-    try:
-        importlib.import_module(pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
-
-import requests
 import pandas as pd
+import requests
+import streamlit as st
 
-from google.colab import files
-from google.colab import drive
 
-
-DEFAULT_FILENAME = "appstore_reviews.xlsx"
 SHEET_NAME = "reviews"
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
@@ -43,13 +26,8 @@ class AppStoreScraperError(Exception):
     pass
 
 
-def log(message: str) -> None:
-    print(message)
-
-
 def safe_request_json(url: str, params: Optional[dict] = None) -> dict:
     last_error = None
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -125,14 +103,14 @@ def lookup_app_by_id(app_id: int, country: str = "us") -> Tuple[int, str]:
 
     results = data.get("results", [])
     if not results:
-        raise AppStoreScraperError(f"Application with Apple ID {app_id} not found.")
+        raise AppStoreScraperError(f"Приложение с Apple ID {app_id} не найдено.")
 
     app = results[0]
     found_id = app.get("trackId")
     app_name = app.get("trackName") or "Unknown app"
 
     if not found_id:
-        raise AppStoreScraperError("Apple ID lookup returned invalid data.")
+        raise AppStoreScraperError("Apple ID lookup вернул некорректные данные.")
 
     return int(found_id), app_name
 
@@ -174,7 +152,7 @@ def search_app_by_name(app_name_query: str, country: str = "us") -> Tuple[int, s
 
     results = data.get("results", [])
     if not results:
-        raise AppStoreScraperError(f'Application "{app_name_query}" not found.')
+        raise AppStoreScraperError(f'Приложение "{app_name_query}" не найдено.')
 
     ranked = sorted(results, key=lambda x: score_search_result(app_name_query, x), reverse=True)
     best = ranked[0]
@@ -183,7 +161,7 @@ def search_app_by_name(app_name_query: str, country: str = "us") -> Tuple[int, s
     app_name = best.get("trackName") or "Unknown app"
 
     if not app_id:
-        raise AppStoreScraperError("Search returned invalid app data.")
+        raise AppStoreScraperError("Поиск вернул некорректные данные приложения.")
 
     return int(app_id), app_name
 
@@ -191,7 +169,7 @@ def search_app_by_name(app_name_query: str, country: str = "us") -> Tuple[int, s
 def resolve_app(app_input: str, country: str = "us") -> Tuple[int, str]:
     app_input = app_input.strip()
     if not app_input:
-        raise AppStoreScraperError("Application identifier is empty.")
+        raise AppStoreScraperError("Укажи Apple ID, ссылку App Store или название приложения.")
 
     app_id = extract_app_id_from_input(app_input)
     if app_id is not None:
@@ -226,7 +204,7 @@ def extract_text(entry: dict) -> str:
     if isinstance(content, dict):
         return normalize_text(str(content.get("label", "")))
     return ""
-
+    
 
 def extract_date(entry: dict) -> str:
     updated = entry.get("updated", {})
@@ -336,7 +314,6 @@ def fetch_reviews_with_country_fallback(app_id: int, limit: int) -> Tuple[List[D
         try:
             reviews = fetch_reviews_for_country(app_id, limit, country)
             if reviews:
-                log(f"Reviews found in storefront: {country}")
                 return reviews, country
 
             if len(reviews) > len(best_reviews):
@@ -348,172 +325,83 @@ def fetch_reviews_with_country_fallback(app_id: int, limit: int) -> Tuple[List[D
     return best_reviews, best_country
 
 
-def load_existing_reviews(file_path: str) -> pd.DataFrame:
-    path = Path(file_path)
-    if not path.exists():
-        return pd.DataFrame(columns=["date", "author", "rating", "text", "_uid"])
+def prepare_dataframe(reviews: List[Dict[str, str]]) -> pd.DataFrame:
+    if not reviews:
+        return pd.DataFrame(columns=["date", "author", "rating", "text"])
 
-    try:
-        df = pd.read_excel(file_path, sheet_name=SHEET_NAME, engine="openpyxl")
-    except Exception as e:
-        raise AppStoreScraperError(f"Failed to read existing Excel file: {e}")
-
-    expected_cols = ["date", "author", "rating", "text"]
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = df[expected_cols].copy()
+    df = pd.DataFrame(reviews, columns=["date", "author", "rating", "text"])
     df["date"] = df["date"].astype(str).map(normalize_text)
     df["author"] = df["author"].astype(str).map(normalize_text)
     df["text"] = df["text"].astype(str).map(normalize_text)
     df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0).astype(int)
     df["_uid"] = df.apply(lambda row: make_review_uid(row["date"], row["author"], row["text"]), axis=1)
-    return df
+    df = df.drop_duplicates(subset="_uid", keep="first").copy()
+
+    df["_sort_date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+    df = df.sort_values(by="_sort_date", ascending=False, na_position="last")
+    df = df.drop(columns=["_uid", "_sort_date"])
+
+    return df.reset_index(drop=True)
 
 
-def append_only_new_reviews(existing_df: pd.DataFrame, new_reviews: List[Dict[str, str]]) -> Tuple[pd.DataFrame, int]:
-    if not new_reviews:
-        result = existing_df.copy()
-        if "_uid" not in result.columns:
-            result["_uid"] = result.apply(lambda row: make_review_uid(row["date"], row["author"], row["text"]), axis=1)
-        return result, 0
-
-    new_df = pd.DataFrame(new_reviews, columns=["date", "author", "rating", "text"])
-    new_df["date"] = new_df["date"].astype(str).map(normalize_text)
-    new_df["author"] = new_df["author"].astype(str).map(normalize_text)
-    new_df["text"] = new_df["text"].astype(str).map(normalize_text)
-    new_df["rating"] = pd.to_numeric(new_df["rating"], errors="coerce").fillna(0).astype(int)
-    new_df["_uid"] = new_df.apply(lambda row: make_review_uid(row["date"], row["author"], row["text"]), axis=1)
-
-    existing_uids = set(existing_df["_uid"].tolist()) if not existing_df.empty else set()
-    only_new_df = new_df[~new_df["_uid"].isin(existing_uids)].copy()
-
-    if existing_df.empty:
-        combined = only_new_df.copy()
-    else:
-        combined = pd.concat([existing_df, only_new_df], ignore_index=True)
-
-    combined = combined.drop_duplicates(subset="_uid", keep="first").copy()
-    combined["_sort_date"] = pd.to_datetime(combined["date"], errors="coerce", utc=True)
-    combined = combined.sort_values(by="_sort_date", ascending=False, na_position="last").drop(columns=["_sort_date"])
-
-    return combined, len(only_new_df)
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=SHEET_NAME, index=False)
+    output.seek(0)
+    return output.getvalue()
 
 
-def save_reviews_to_excel(df: pd.DataFrame, file_path: str) -> None:
-    output_df = df[["date", "author", "rating", "text"]].copy()
+st.set_page_config(page_title="App Store Reviews Scraper", layout="wide")
 
+st.title("Сбор отзывов из Apple App Store")
+st.caption("Streamlit-версия без Colab-логики")
+
+with st.form("scraper_form"):
+    app_input = st.text_input(
+        "Apple ID, ссылка App Store или название приложения",
+        placeholder="Например: 6479202680 или https://apps.apple.com/... или ChatGPT"
+    )
+    limit = st.number_input(
+        "Количество последних отзывов",
+        min_value=1,
+        max_value=5000,
+        value=100,
+        step=1
+    )
+    submitted = st.form_submit_button("Собрать отзывы")
+
+if submitted:
     try:
-        with pd.ExcelWriter(file_path, engine="openpyxl", mode="w") as writer:
-            output_df.to_excel(writer, sheet_name=SHEET_NAME, index=False)
-    except Exception as e:
-        raise AppStoreScraperError(f"Failed to write Excel file: {e}")
-
-
-def ask_save_mode() -> Tuple[str, str]:
-    print("\nChoose where to save the Excel file:")
-    print("1 - Save in Colab and immediately download to this computer")
-    print("2 - Save to Google Drive folder")
-    print("3 - Save only in /content")
-
-    choice = input("Enter 1, 2, or 3: ").strip()
-
-    if choice not in {"1", "2", "3"}:
-        raise AppStoreScraperError("Invalid save option. Enter 1, 2, or 3.")
-
-    filename = input(f"Enter file name [{DEFAULT_FILENAME}]: ").strip()
-    if not filename:
-        filename = DEFAULT_FILENAME
-    if not filename.lower().endswith(".xlsx"):
-        filename += ".xlsx"
-
-    return choice, filename
-
-
-def get_output_path(save_mode: str, filename: str) -> str:
-    if save_mode == "1":
-        return str(Path("/content") / filename)
-
-    if save_mode == "3":
-        return str(Path("/content") / filename)
-
-    if save_mode == "2":
-        log("Mounting Google Drive...")
-        drive.mount("/content/drive")
-
-        folder = input(
-            "Enter Google Drive folder path relative to MyDrive "
-            "(example: Reviews/AppStore): "
-        ).strip()
-
-        base_dir = Path("/content/drive/MyDrive")
-        target_dir = base_dir / folder if folder else base_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        return str(target_dir / filename)
-
-    raise AppStoreScraperError("Unknown save mode.")
-
-
-def get_user_inputs() -> Tuple[str, int, str]:
-    app_input = input("Enter Apple App ID, App Store link, or app name: ").strip()
-    limit_input = input("Enter the number of latest reviews to load: ").strip()
-
-    if not app_input:
-        raise AppStoreScraperError("Application identifier is required.")
-
-    if not limit_input.isdigit():
-        raise AppStoreScraperError("The number of reviews must be a positive integer.")
-
-    limit = int(limit_input)
-    if limit <= 0:
-        raise AppStoreScraperError("The number of reviews must be greater than 0.")
-
-    save_mode, filename = ask_save_mode()
-    output_path = get_output_path(save_mode, filename)
-
-    return app_input, limit, output_path, save_mode
-
-
-def main():
-    try:
-        app_input, limit, output_file, save_mode = get_user_inputs()
-
-        app_id, app_name = resolve_app(app_input, country="us")
-        log(f"Application found: {app_name} (Apple ID: {app_id})")
-
-        reviews, found_country = fetch_reviews_with_country_fallback(app_id=app_id, limit=limit)
+        with st.spinner("Ищу приложение и загружаю отзывы..."):
+            app_id, app_name = resolve_app(app_input, country="us")
+            reviews, found_country = fetch_reviews_with_country_fallback(app_id, int(limit))
 
         if not reviews:
-            raise AppStoreScraperError(
-                "No reviews received for this application. "
-                "Possible reasons: no public reviews in tested storefronts, "
-                "RSS feed unavailable for this app, or the app has no public reviews."
+            st.error(
+                "Отзывы не получены. Возможные причины: у приложения нет публичных отзывов, "
+                "RSS-лента недоступна для этого приложения или отзывы отсутствуют в проверенных storefront."
+            )
+        else:
+            df = prepare_dataframe(reviews)
+            excel_bytes = dataframe_to_excel_bytes(df)
+
+            st.success("Готово")
+            st.write(f"**Приложение:** {app_name}")
+            st.write(f"**Apple ID:** {app_id}")
+            st.write(f"**Storefront:** {found_country or 'не определён'}")
+            st.write(f"**Загружено отзывов:** {len(df)}")
+
+            st.dataframe(df, use_container_width=True)
+
+            st.download_button(
+                label="Скачать Excel",
+                data=excel_bytes,
+                file_name="appstore_reviews.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-        if found_country:
-            log(f"Storefront used for reviews: {found_country}")
-
-        log(f"Reviews loaded from App Store: {len(reviews)}")
-
-        existing_df = load_existing_reviews(output_file)
-        combined_df, added_count = append_only_new_reviews(existing_df, reviews)
-
-        save_reviews_to_excel(combined_df, output_file)
-
-        log(f"New reviews added: {added_count}")
-        log(f"Total reviews in file: {len(combined_df)}")
-        log(f"Saved file: {Path(output_file).resolve()}")
-
-        if save_mode == "1":
-            log("Starting file download to your computer...")
-            files.download(output_file)
-
     except AppStoreScraperError as e:
-        print(f"Error: {e}")
+        st.error(str(e))
     except Exception as e:
-        print(f"Unexpected error: {e}")
-
-
-main()
+        st.error(f"Непредвиденная ошибка: {e}")
