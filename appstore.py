@@ -11,7 +11,6 @@ import requests
 import streamlit as st
 
 
-SHEET_NAME = "reviews"
 REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
@@ -204,7 +203,7 @@ def extract_text(entry: dict) -> str:
     if isinstance(content, dict):
         return normalize_text(str(content.get("label", "")))
     return ""
-    
+
 
 def extract_date(entry: dict) -> str:
     updated = entry.get("updated", {})
@@ -344,18 +343,15 @@ def prepare_dataframe(reviews: List[Dict[str, str]]) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=SHEET_NAME, index=False)
-    output.seek(0)
-    return output.getvalue()
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    csv_text = df.to_csv(index=False, encoding="utf-8-sig")
+    return csv_text.encode("utf-8-sig")
 
 
 st.set_page_config(page_title="App Store Reviews Scraper", layout="wide")
 
 st.title("Сбор отзывов из Apple App Store")
-st.caption("Streamlit-версия без Colab-логики")
+st.caption("Выгрузка в CSV без openpyxl")
 
 with st.form("scraper_form"):
     app_input = st.text_input(
@@ -384,7 +380,7 @@ if submitted:
             )
         else:
             df = prepare_dataframe(reviews)
-            excel_bytes = dataframe_to_excel_bytes(df)
+            csv_bytes = dataframe_to_csv_bytes(df)
 
             st.success("Готово")
             st.write(f"**Приложение:** {app_name}")
@@ -395,10 +391,10 @@ if submitted:
             st.dataframe(df, use_container_width=True)
 
             st.download_button(
-                label="Скачать Excel",
-                data=excel_bytes,
-                file_name="appstore_reviews.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label="Скачать CSV",
+                data=csv_bytes,
+                file_name="appstore_reviews.csv",
+                mime="text/csv",
             )
 
     except AppStoreScraperError as e:
